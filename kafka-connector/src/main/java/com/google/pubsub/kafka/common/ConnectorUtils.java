@@ -47,7 +47,7 @@ public class ConnectorUtils {
   public static final String KAFKA_OFFSET_ATTRIBUTE = "kafka.offset";
   public static final String KAFKA_TIMESTAMP_ATTRIBUTE = "kafka.timestamp";
 
-  /** Return {@link io.grpc.Channel} which is used by Cloud Pub/Sub gRPC API's. */
+  /** Return {@link io.grpc.Channel} which is used by Cloud Pub/Sub gRPC API's.
   public static Channel getChannel() throws IOException {
     ManagedChannel channelImpl =
         NettyChannelBuilder.forAddress(ENDPOINT, 443)
@@ -61,4 +61,5 @@ public class ConnectorUtils {
             Executors.newCachedThreadPool());
     return ClientInterceptors.intercept(channelImpl, interceptor);
   }
+   */
 }
