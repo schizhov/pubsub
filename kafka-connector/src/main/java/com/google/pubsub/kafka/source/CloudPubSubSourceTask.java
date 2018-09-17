@@ -15,16 +15,18 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.google.pubsub.kafka.source;
 
-import com.google.cloud.pubsub.v1.MessageReceiver;
+import com.google.api.core.ApiService;
+import com.google.api.gax.batching.FlowControlSettings;
+import com.google.api.gax.batching.FlowController;
+import com.google.api.gax.core.FixedExecutorProvider;
+import com.google.cloud.pubsub.v1.AckReplyConsumer;
 import com.google.cloud.pubsub.v1.Subscriber;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
-import com.google.protobuf.Empty;
 import com.google.protobuf.util.Timestamps;
 import com.google.pubsub.kafka.common.ConnectorUtils;
-import com.google.pubsub.v1.*;
+import com.google.pubsub.v1.ProjectSubscriptionName;
+import com.google.pubsub.v1.PubsubMessage;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -36,6 +38,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.Map.Entry;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 /**
  * A {@link SourceTask} used by a {@link CloudPubSubSourceConnector} to write messages to <a
@@ -46,21 +52,24 @@ public class CloudPubSubSourceTask extends SourceTask {
 
   private static final Logger log = LoggerFactory.getLogger(CloudPubSubSourceTask.class);
 
-  private String kafkaTopic;
-  private String cpsSubscription;
-  private String kafkaMessageKeyAttribute;
-  private String kafkaMessageTimestampAttribute;
-
-  private int cpsMaxBatchSize;
-  // Keep track of all ack ids that have not been sent correctly acked yet.
-  private Set<String> ackIds = Collections.synchronizedSet(new HashSet<String>());
-
-  private Set<String> ackIdsInFlight = Collections.synchronizedSet(new HashSet<String>());
   private final Set<String> standardAttributes = new HashSet<>();
-  private String projectId;
-  private String subscriptionId;
+  private final Map<String, MessageInFlight> messagesInFlight = new ConcurrentHashMap<>();
+  private final Map<String, MessageInFlight> received = new ConcurrentHashMap<>();
   private final Object subscriberLock = new Object();
-  private Subscriber subscriber;
+
+  private volatile String projectId;
+  private volatile String subscriptionId;
+  private volatile String kafkaTopic;
+  private volatile String kafkaMessageKeyAttribute;
+  private volatile String kafkaMessageTimestampAttribute;
+  private volatile int cpsMaxBatchSize;
+
+  private volatile Subscriber subscriber;
+
+  private final AtomicLong messageCounter =new AtomicLong();
+  private final AtomicLong ackCounter =new AtomicLong();
+  private final AtomicLong nackCounter =new AtomicLong();
+  private final AtomicBoolean stopping = new AtomicBoolean();
 
   public CloudPubSubSourceTask() {
   }
@@ -85,165 +94,107 @@ public class CloudPubSubSourceTask extends SourceTask {
     standardAttributes.add(kafkaMessageKeyAttribute);
     standardAttributes.add(kafkaMessageTimestampAttribute);
 
-    ProjectSubscriptionName subscriptionName = ProjectSubscriptionName.of(projectId, subscriptionId);
-    // Instantiate an asynchronous message receiver
-    MessageReceiver receiver =
-            (message, consumer) -> {
-              // handle incoming message, then ack/nack the received message
-              log.debug("Id : " + message.getMessageId());
-              log.debug("Data : " + message.getData().toStringUtf8());
-              consumer.ack();
-            };
-
-
-    // Create a subscriber for "my-subscription-id" bound to the message receiver
     synchronized (subscriberLock) {
       if (subscriber != null) {
         throw new IllegalStateException("Starting already started task");
       }
-      subscriber = Subscriber.newBuilder(subscriptionName, receiver).build();
+
+      FlowControlSettings flowControlSettings =
+              FlowControlSettings.newBuilder()
+                      .setMaxOutstandingElementCount((long) cpsMaxBatchSize)
+                      .setMaxOutstandingRequestBytes(1_000_000_000L)
+                      .setLimitExceededBehavior(FlowController.LimitExceededBehavior.Block)
+                      .build();
+
+      subscriber = Subscriber.newBuilder(ProjectSubscriptionName.of(projectId, subscriptionId), this::onPubsubMessageReceived)
+              .setFlowControlSettings(flowControlSettings)
+              /*.setExecutorProvider(FixedExecutorProvider.create(Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                  Thread t = new Thread(r, "bom-exec");
+                  t.setDaemon(true);
+                  return t;
+                }
+              })))*/
+              /*.setSystemExecutorProvider(FixedExecutorProvider.create(Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                  Thread t = new Thread(r, "bom-sys");
+                  t.setDaemon(true);
+                  return t;
+                }
+              })))*/
+              .setParallelPullCount(1) //TODO configure
+              .build();
+
+      subscriber.addListener(
+              new Subscriber.Listener() {
+
+                @Override
+                public void stopping(ApiService.State from) {
+                  log.info("Stopping: {}", from);
+                }
+
+                @Override
+                public void terminated(ApiService.State from) {
+                  log.info("Terminated: {}", from);
+                }
+
+                public void failed(Subscriber.State from, Throwable failure) {
+                  log.error("Failed: {}", from, failure);
+                }
+              },
+              MoreExecutors.directExecutor()
+      );
+
+
       subscriber.startAsync();
+      //Executors.newScheduledThreadPool(1).schedule(this::stop, 10, TimeUnit.SECONDS);
+
     }
     log.info("Started with {}", props);
   }
 
+
+
   @Override
-  public void commitRecord(SourceRecord record) throws InterruptedException {
-    super.commitRecord(record);
+  public void commitRecord(SourceRecord record) {
+    commitRecord(record, true);
   }
 
-  @Override
-  public List<SourceRecord> poll() throws InterruptedException {
-    ackMessages();
-    log.debug("Polling...");
-    PullRequest request =
-            PullRequest.newBuilder()
-                    .setSubscription(cpsSubscription)
-                    .setReturnImmediately(false)
-                    .setMaxMessages(cpsMaxBatchSize)
-                    .build();
-    try {
-      PullResponse response = subscriber.pull(request).get();
-      List<SourceRecord> sourceRecords = new ArrayList<>();
-      log.trace("Received " + response.getReceivedMessagesList().size() + " messages");
-      for (ReceivedMessage rm : response.getReceivedMessagesList()) {
-        PubsubMessage message = rm.getMessage();
-        String ackId = rm.getAckId();
-        // If we are receiving this message a second (or more) times because the ack for it failed
-        // then do not create a SourceRecord for this message. In case we are waiting for ack
-        // response we also skip the message
-        if (ackIds.contains(ackId) || ackIdsInFlight.contains(ackId)) {
-          continue;
-        }
-        ackIds.add(ackId);
-        Map<String, String> messageAttributes = message.getAttributes();
-        String key = messageAttributes.get(kafkaMessageKeyAttribute);
-        Long timestamp = getLongValue(messageAttributes.get(kafkaMessageTimestampAttribute));
-        if (timestamp == null) {
-          timestamp = Timestamps.toMillis(message.getPublishTime());
-        }
-        ByteString messageData = message.getData();
-        byte[] messageBytes = messageData.toByteArray();
-
-        boolean hasCustomAttributes = !standardAttributes.containsAll(messageAttributes.keySet());
-
-        SourceRecord record = null;
-        if (hasCustomAttributes) {
-          SchemaBuilder valueSchemaBuilder = SchemaBuilder.struct().field(
-                  ConnectorUtils.KAFKA_MESSAGE_CPS_BODY_FIELD,
-                  Schema.BYTES_SCHEMA);
-
-          for (Entry<String, String> attribute :
-                  messageAttributes.entrySet()) {
-            if (!attribute.getKey().equals(kafkaMessageKeyAttribute)) {
-              valueSchemaBuilder.field(attribute.getKey(),
-                      Schema.STRING_SCHEMA);
-            }
-          }
-
-          Schema valueSchema = valueSchemaBuilder.build();
-          Struct value =
-                  new Struct(valueSchema)
-                          .put(ConnectorUtils.KAFKA_MESSAGE_CPS_BODY_FIELD,
-                                  messageBytes);
-          for (Field field : valueSchema.fields()) {
-            if (!field.name().equals(
-                    ConnectorUtils.KAFKA_MESSAGE_CPS_BODY_FIELD)) {
-              value.put(field.name(), messageAttributes.get(field.name()));
-            }
-          }
-          record =
-                  new SourceRecord(
-                          null,
-                          null,
-                          kafkaTopic,
-                          null,
-                          Schema.OPTIONAL_STRING_SCHEMA,
-                          key,
-                          valueSchema,
-                          value,
-                          timestamp);
-        } else {
-          record =
-                  new SourceRecord(
-                          null,
-                          null,
-                          kafkaTopic,
-                          null,
-                          Schema.OPTIONAL_STRING_SCHEMA,
-                          key,
-                          Schema.BYTES_SCHEMA,
-                          messageBytes,
-                          timestamp);
-        }
-        sourceRecords.add(record);
+  public void commitRecord(SourceRecord record, boolean ack) {
+    String messageId = (String) record.sourceOffset().get(subscriptionId);
+    MessageInFlight m = messagesInFlight.get(messageId);
+    if (m != null) {
+      if (ack) {
+        m.ack();
+        ackCounter.incrementAndGet();
       }
-      return sourceRecords;
-    } catch (Exception e) {
-      log.info("Error while retrieving records, treating as an empty poll. " + e);
-      return new ArrayList<>();
+      else {
+        m.nack();
+        nackCounter.incrementAndGet();
+      }
+      messagesInFlight.remove(messageId);
+
+      //log.trace("Acked[{}] {}", ack, record.key());
+    } else {
+      log.error("Nothing to ack[{}] for {}", ack, record.key());
     }
+    //logCounters();
+  }
+
+  private void logCounters() {
+    log.info("M{},A{},N{},D{}",messageCounter.get(), ackCounter.get(), nackCounter.get(), messageCounter.get()-ackCounter.get()-nackCounter.get());
   }
 
   @Override
-  public void commit() throws InterruptedException {
-    ackMessages();
+  public List<SourceRecord> poll() {
+    Map<String, MessageInFlight> batch = new HashMap<>();
+    batch.putAll(received);
+    messagesInFlight.putAll(batch);
+    received.keySet().removeAll(batch.keySet());
+    return batch.values().stream().map(MessageInFlight::getRecord).collect(Collectors.toList());
   }
-
-  /**
-   * Attempt to ack all ids in {@link #ackIds}.
-   */
-  private void ackMessages() {
-    if (ackIds.size() != 0) {
-      AcknowledgeRequest.Builder requestBuilder = AcknowledgeRequest.newBuilder()
-              .setSubscription(cpsSubscription);
-      final Set<String> ackIdsBatch = new HashSet<>();
-      synchronized (ackIds) {
-        requestBuilder.addAllAckIds(ackIds);
-        ackIdsInFlight.addAll(ackIds);
-        ackIdsBatch.addAll(ackIds);
-        ackIds.clear();
-      }
-      ListenableFuture<Empty> response = subscriber.ackMessages(requestBuilder.build());
-      Futures.addCallback(
-              response,
-              new FutureCallback<Empty>() {
-                @Override
-                public void onSuccess(Empty result) {
-                  ackIdsInFlight.removeAll(ackIdsBatch);
-                  log.trace("Successfully acked a set of messages.");
-                }
-
-                @Override
-                public void onFailure(Throwable t) {
-                  ackIds.addAll(ackIdsBatch);
-                  ackIdsInFlight.removeAll(ackIdsBatch);
-                  log.error("An exception occurred acking messages: " + t);
-                }
-              });
-    }
-  }
-
 
   private Long getLongValue(String timestamp) {
     if (timestamp == null) {
@@ -258,14 +209,121 @@ public class CloudPubSubSourceTask extends SourceTask {
   }
 
   @Override
-  public void stop() {
-    synchronized (subscriberLock) {
-      if (subscriber != null) {
-        subscriber.stopAsync().awaitTerminated(); //TODO make it unlock after some timeout
+  public void commit() {
+    log.info("Committing. Stopping ={}", stopping.get());
+    logCounters();
+    if (stopping.get()) {
+      poll().forEach(r -> commitRecord(r, false));
+      while (!subscriber.state().equals(ApiService.State.TERMINATED)) {
+        try {
+          subscriber.awaitTerminated(1000, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+          log.warn("Failed to stop {} in time", subscriber, e);
+          logCounters();
+        }
       }
     }
-
+    logCounters();
+    log.info("Committed. Stopping ={}", stopping.get());
   }
 
+
+  @Override
+  public void stop() {
+    log.info("Stopping");
+    stopping.set(true);
+    synchronized (subscriberLock) {
+      //long waitMs = 5000;//TODO timeout configurable
+      if (subscriber != null) {
+        log.info("Stopping subscriber {}", messageCounter.get());
+
+        subscriber.stopAsync();
+
+        /*while (!subscriber.state().equals(ApiService.State.TERMINATED)) {
+          try {
+            subscriber.awaitTerminated(waitMs, TimeUnit.MILLISECONDS);
+          } catch (TimeoutException e) {
+            log.warn("Failed to stop {} in time", subscriber, e);
+            List<SourceRecord> records = poll();
+            messagesInFlight.values().forEach(r -> commitRecord( r.getRecord(), false));
+            records.forEach(r -> commitRecord(r, false));
+            log.info("Stopping. Nacked {} records. Subscriber is {}. Waiting {}ms", records.size(), subscriber.state(), waitMs);
+            logCounters();
+          }
+        }*/
+      }
+    }
+    logCounters();
+  }
+
+  private void onPubsubMessageReceived(PubsubMessage message, AckReplyConsumer ackReplyConsumer) {
+    MessageInFlight m = new MessageInFlight(message.getMessageId(), convert(message), ackReplyConsumer);
+    received.put(message.getMessageId(), m);
+    Map<String, String> messageAttributes = message.getAttributes();
+    String key = messageAttributes.get(kafkaMessageKeyAttribute);
+    messageCounter.incrementAndGet();
+    log.trace("Received {}, {}", key, messageCounter.get());
+  }
+
+  SourceRecord convert(PubsubMessage message) {
+    Map<String, String> messageId = Collections.singletonMap(subscriptionId, message.getMessageId());
+    Map<String, String> messageAttributes = message.getAttributes();
+    String key = messageAttributes.get(kafkaMessageKeyAttribute);
+    Long timestamp = getLongValue(messageAttributes.get(kafkaMessageTimestampAttribute));
+    if (timestamp == null) {
+      timestamp = Timestamps.toMillis(message.getPublishTime());
+    }
+    ByteString messageData = message.getData();
+    byte[] messageBytes = messageData.toByteArray();
+
+    boolean hasCustomAttributes = !standardAttributes.containsAll(messageAttributes.keySet());
+
+    if (hasCustomAttributes) {
+      SchemaBuilder valueSchemaBuilder = SchemaBuilder.struct().field(
+              ConnectorUtils.KAFKA_MESSAGE_CPS_BODY_FIELD,
+              Schema.BYTES_SCHEMA);
+
+      for (Entry<String, String> attribute :
+              messageAttributes.entrySet()) {
+        if (!attribute.getKey().equals(kafkaMessageKeyAttribute)) {
+          valueSchemaBuilder.field(attribute.getKey(),
+                  Schema.STRING_SCHEMA);
+        }
+      }
+
+      Schema valueSchema = valueSchemaBuilder.build();
+      Struct value =
+              new Struct(valueSchema)
+                      .put(ConnectorUtils.KAFKA_MESSAGE_CPS_BODY_FIELD,
+                              messageBytes);
+      for (Field field : valueSchema.fields()) {
+        if (!field.name().equals(
+                ConnectorUtils.KAFKA_MESSAGE_CPS_BODY_FIELD)) {
+          value.put(field.name(), messageAttributes.get(field.name()));
+        }
+      }
+      return new SourceRecord(
+              null,
+              messageId,
+              kafkaTopic,
+              null,
+              Schema.OPTIONAL_STRING_SCHEMA,
+              key,
+              valueSchema,
+              value,
+              timestamp);
+    } else {
+      return new SourceRecord(
+              null,
+              messageId,
+              kafkaTopic,
+              null,
+              Schema.OPTIONAL_STRING_SCHEMA,
+              key,
+              Schema.BYTES_SCHEMA,
+              messageBytes,
+              timestamp);
+    }
+  }
 
 }
